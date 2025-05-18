@@ -1,0 +1,186 @@
+//Alerta sísmica para eventos en México con magnitud mayor a 5
+//La alerta manda un mensaje a telegram y enciende una alarma
+//Consultar PDF para ver las conexiones externas
+
+#include <ESP8266WiFi.h>             
+#include <WiFiClientSecure.h>         
+#include <ESP8266HTTPClient.h>        
+#include <ArduinoJson.h>              
+
+//WiFi
+const char* ssid = "";                //Nombre de la red   
+const char* password = " ";           //Contraseña de la red     
+
+//Token del bot de Telegram (https://t.me/AlarmaSismicaITSEbot)
+const String botToken = " ";          //Agregar token
+
+//IDs de los chats (https://t.me/userinfobot)
+const String chatIds[] = {
+  " "                               //Agregamos otro y ponemos ",", se recomienda hacerse en grupos de Telegram, por simplicidad
+};
+const int numChats = sizeof(chatIds) / sizeof(chatIds[0]);  
+
+//Pines
+const int botonPin = 2;     //GPIO2 (PIN5)
+const int alarmaPin = 0;    //GPIO0 (PIN3)
+
+//Variables
+unsigned long ultimoCheck = 0;    
+unsigned long intervalo = 1000; //1 segundo (Checa el USGS)
+
+void setup() {
+  Serial.begin(9600);  
+
+  pinMode(botonPin, INPUT_PULLUP); //El botón de prueba está en pull-up en el circuito 
+  pinMode(alarmaPin, OUTPUT);       
+  digitalWrite(alarmaPin, LOW);      
+
+  //Mensaje serial
+  Serial.println("Conectando a WiFi...");
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi conectado!");
+  Serial.print("Dirección IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() {
+  if (digitalRead(botonPin) == LOW) {
+    Serial.println("Botón presionado, enviando alerta de prueba");
+    enviarAlerta("🔔 Mensaje de prueba activada desde ITSE");
+    activarAlarma();
+    delay(500);  
+  }
+
+  if (millis() - ultimoCheck > intervalo && WiFi.status() == WL_CONNECTED) {
+    ultimoCheck = millis();
+    verificarSismo();
+  }
+}
+
+//Consultar la API de sismos del USGS
+void verificarSismo() {
+  Serial.println("Consultando sismos...");
+
+  WiFiClientSecure wifiClient;   
+  wifiClient.setInsecure();      
+  HTTPClient http;
+
+  String url = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson"; 
+  http.begin(wifiClient, url);
+
+  int httpCode = http.GET();  
+
+  if (httpCode == HTTP_CODE_OK) {  
+    String payload = http.getString();  
+    StaticJsonDocument<4096> doc;  // Usamos StaticJsonDocument para evitar el uso de memoria dinámica
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (!error) {
+      JsonArray features = doc["features"];  
+
+      for (JsonObject sismo : features) {
+        float magnitud = sismo["properties"]["mag"];
+        const char* lugar = sismo["properties"]["place"];
+
+        if (magnitud > 5.0 && strstr(lugar, "Mexico") != NULL) {
+          String mensaje = "⚠️ Sismo en México\nMagnitud: " + String(magnitud) + "\nLugar: " + String(lugar);
+          Serial.println("Sismo detectado, enviando alerta...");
+          enviarAlerta(mensaje);
+          activarAlarma();
+          break;  
+        }
+      }
+    } else {
+      Serial.print("Error al leer JSON: ");
+      Serial.println(error.c_str());
+    }
+  } else {
+    Serial.print("Error HTTP: ");
+    Serial.println(httpCode);  
+  }
+
+  http.end();  
+  limpiarMemoria(); // Limpia todo después de cada consulta
+}
+
+//Activar la alarma
+void activarAlarma() {
+  Serial.println("ALERTA ACTIVADA");
+
+  unsigned long inicio = millis();
+  while (millis() - inicio < 30000) {  //30 segundos de alarma
+    digitalWrite(alarmaPin, HIGH);
+    delay(100);   //ON 100 ms
+    digitalWrite(alarmaPin, LOW);
+    delay(100);   //OFF APAGADO 100 ms
+  }
+
+  Serial.println("ALERTA FINALIZADA");
+}
+
+//Enviar una alerta a Telegram usando POST
+void enviarAlerta(String mensaje) {
+  for (int i = 0; i < numChats; i++) {
+    WiFiClientSecure client;
+    client.setInsecure();  
+    HTTPClient http;
+
+    String url = "https://api.telegram.org/bot" + botToken + "/sendMessage";
+
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+    String postData = "chat_id=" + chatIds[i] + "&text=" + urlencode(mensaje);
+
+    int httpCode = http.POST(postData);  
+
+    if (httpCode == HTTP_CODE_OK) {
+      Serial.println("Mensaje enviado a Telegram.");
+    } else {
+      Serial.print("Error al enviar mensaje: ");
+      Serial.println(httpCode);
+      Serial.println(http.getString());  
+    }
+
+    http.end();
+    delay(100);  
+  }
+  limpiarMemoria(); //Limpia después de mandar cada alerta
+}
+
+//Codificar URL (emojis)
+String urlencode(String str) {
+  String encoded = "";
+  char c;
+  char code0, code1;
+
+  for (int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    if (isalnum(c)) {
+      encoded += c;
+    } else if (c == ' ') {
+      encoded += '+';
+    } else {
+      code1 = (c & 0xf) + '0';
+      if ((c & 0xf) > 9) code1 = (c & 0xf) - 10 + 'A';
+      code0 = ((c >> 4) & 0xf) + '0';
+      if (((c >> 4) & 0xf) > 9) code0 = ((c >> 4) & 0xf) - 10 + 'A';
+      encoded += '%';
+      encoded += code0;
+      encoded += code1;
+    }
+  }
+  return encoded;
+}
+
+//Liberar memoria de objetos internos
+void limpiarMemoria() {
+  yield(); //Permite que el ESP haga housekeeping
+  delay(5); //Pequeña pausa para estabilizar memoria
+}
